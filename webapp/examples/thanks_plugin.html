@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="/static/plugin-sdk.js"></script>
+    <style>body { margin: 0; padding: 0; }</style>
+</head>
+<body>
+<div class="grid" style="margin-top:0">
+    <div class="stat"><div class="v" id="sent">—</div><div class="l">Отправлено за сессию</div></div>
+    <div class="stat"><div class="v" id="last" style="font-size:15px">—</div><div class="l">Последний покупатель</div></div>
+</div>
+<div style="margin-top:10px"><button class="btn secondary" id="reset">Сбросить счётчик</button></div>
+
+<script>
+    function show(s) {
+        document.getElementById("sent").textContent = s.sent;
+        document.getElementById("last").textContent = s.last ? s.last.buyer : "—";
+    }
+    Plugin.call("stats").then(show).catch((e) => Plugin.toast(e.message));
+    document.getElementById("reset").onclick = async () => {
+        show(await Plugin.call("reset"));
+        Plugin.haptic("medium");
+        Plugin.toast("Сброшено");
+    };
+</script>
+</body>
+</html>
