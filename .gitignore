@@ -10,9 +10,4 @@
 /build
 /dist
 test.py
-*.zip/configs
-/storage
-/logs
-/plugins/*.py
-__pycache__/
-*.pyc
+*.zip

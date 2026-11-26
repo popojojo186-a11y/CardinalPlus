@@ -6,6 +6,10 @@ Cardinal Plus — Telegram Mini App для FunPay Cardinal.
 from __future__ import annotations
 
 import logging
+import os
+import secrets
+import subprocess
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -20,7 +24,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("FPC.webapp")
 
-_state: dict = {"app": None, "tunnel": None, "url": None}
+_state: dict = {"app": None, "tunnel": None, "url": None, "front": None}
 
 
 def get_public_url() -> str | None:
@@ -40,8 +44,13 @@ def start(cardinal: Cardinal) -> None:
 
     host = cfg.get("host") or "127.0.0.1"
     port = int(cfg.get("port") or 8095)
+    public_url = (cfg.get("public_url") or "").strip().rstrip("/")
+    tunnel_mode = "none" if public_url or cfg.get("tunnel", "cloudflare") != "cloudflare" else "cloudflare"
+    # Входная дверь держит адрес и туннель отдельно от Cardinal — тогда перезапуск Cardinal не ломает приложение.
+    use_front = bool(cfg.get("keep_alive", True)) and not getattr(sys, "frozen", False) and host == "127.0.0.1"
+    listen = int(cfg.get("backend_port") or port + 100) if use_front else port
     app = None
-    for p in range(port, port + 10):
+    for p in range(listen, listen + 10):
         try:
             app = WebApp(cardinal, host, p)
             app.start()
@@ -57,7 +66,18 @@ def start(cardinal: Cardinal) -> None:
     from webapp import plus_updater
     plus_updater.start(cardinal)  # проверка новых версий Cardinal Plus на GitHub
 
-    public_url = (cfg.get("public_url") or "").strip().rstrip("/")
+    if use_front:
+        front = _ensure_front(port, app.port, tunnel_mode, int(cfg.get("keep_alive_idle") or 180))
+        if front:
+            _state["front"] = front
+            if not front["reused"] and not public_url:
+                threading.Thread(target=_reset_menu_button, args=(cardinal,), daemon=True).start()
+            threading.Thread(target=_front_loop, args=(cardinal, cfg, public_url, tunnel_mode), daemon=True,
+                             name="webapp-front").start()
+            return
+        logger.warning("Mini App: не получилось запустить входную дверь — работаю по-старому "
+                       "(при перезапуске Cardinal адрес приложения будет меняться).")
+
     if not public_url:
         threading.Thread(target=_reset_menu_button, args=(cardinal,), daemon=True).start()
     if public_url:
@@ -70,6 +90,94 @@ def start(cardinal: Cardinal) -> None:
         tunnel.start()
     else:
         logger.warning("Mini App: туннель выключен и public_url не указан — приложение доступно только локально.")
+
+
+# ───────────── входная дверь (webapp/front.py) ─────────────
+def _front_key_path(port: int) -> str:
+    return os.path.join("storage", "cache", f"webapp_front_{port}.key")
+
+
+def _front_hello(port: int, token: str, backend: int, timeout: float = 3):
+    """Сказать двери «я жив, я на таком-то порту». Ответ: {"url", "version", "tunnel"} или None."""
+    from webapp import front as front_mod
+    try:
+        r = requests.post(f"http://127.0.0.1:{port}/__front/hello", json={"backend": backend, "version": front_mod.FRONT_VERSION},
+                          headers={"X-Front-Token": token}, timeout=timeout, proxies={"http": None, "https": None})
+        return r.json() if r.status_code == 200 else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def _ensure_front(port: int, backend: int, tunnel_mode: str, idle: int = 180):
+    """Найти уже работающую дверь (тогда адрес приложения прежний) или запустить новую."""
+    from webapp import front as front_mod
+    token = ""
+    try:
+        with open(_front_key_path(port), encoding="utf-8") as f:
+            token = f.read().strip()
+    except OSError:
+        pass
+    if token:
+        r = _front_hello(port, token, backend)
+        if r and r.get("version") == front_mod.FRONT_VERSION and r.get("tunnel") == tunnel_mode:
+            logger.info("Mini App: входная дверь уже работает — адрес приложения не изменился.")
+            return {"port": port, "token": token, "reused": True}
+        if r:  # старая версия двери или другой режим туннеля — закрываем и запускаем новую
+            try:
+                requests.post(f"http://127.0.0.1:{port}/__front/stop", headers={"X-Front-Token": token}, timeout=3,
+                              proxies={"http": None, "https": None})
+            except requests.RequestException:
+                pass
+            time.sleep(2)
+    token = secrets.token_urlsafe(24)
+    os.makedirs(os.path.dirname(_front_key_path(port)), exist_ok=True)
+    with open(_front_key_path(port), "w", encoding="utf-8") as f:
+        f.write(token)
+    cmd = [sys.executable, "-m", "webapp.front", "--port", str(port), "--backend", str(backend), "--tunnel", tunnel_mode,
+           "--idle", str(max(30, idle))]
+    kw = {"cwd": os.getcwd(), "env": {**os.environ, "CP_FRONT_TOKEN": token}, "stdin": subprocess.DEVNULL,
+          "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+    try:
+        if os.name == "nt":
+            base = 0x00000008 | 0x00000200          # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: живёт отдельно от окна Cardinal
+            try:
+                subprocess.Popen(cmd, creationflags=base | 0x01000000, **kw)   # CREATE_BREAKAWAY_FROM_JOB
+            except OSError:
+                subprocess.Popen(cmd, creationflags=base, **kw)
+        else:
+            subprocess.Popen(cmd, start_new_session=True, **kw)
+    except OSError:
+        logger.debug("TRACEBACK", exc_info=True)
+        return None
+    for _ in range(40):
+        time.sleep(0.25)
+        if _front_hello(port, token, backend):
+            logger.info(f"Mini App: входная дверь запущена на порту {port} — перезапуски Cardinal больше не меняют адрес приложения.")
+            return {"port": port, "token": token, "reused": False}
+    return None
+
+
+def _front_loop(cardinal: Cardinal, cfg: dict, public_url: str, tunnel_mode: str) -> None:
+    """Раз в 15 секунд говорим двери, что Cardinal жив, и узнаём адрес туннеля (он меняется только если дверь перезапустилась)."""
+    if public_url:
+        _apply_url(cardinal, public_url, cfg)
+    fails = 0
+    while True:
+        front, app = _state["front"], _state["app"]
+        r = _front_hello(front["port"], front["token"], app.port) if front and app else None
+        if r is None:
+            fails += 1
+            if fails >= 3:   # дверь закрыли или она упала — поднимаем новую
+                new = _ensure_front(front["port"], app.port, tunnel_mode, int(cfg.get("keep_alive_idle") or 180))
+                if new:
+                    _state["front"] = new
+                    fails = 0
+        else:
+            fails = 0
+            url = r.get("url")
+            if not public_url and url and url != _state["url"]:
+                _apply_url(cardinal, url, cfg)
+        time.sleep(2 if not public_url and not _state["url"] else 15)
 
 
 DOH_SERVERS = ("https://cloudflare-dns.com/dns-query", "https://dns.google/resolve")

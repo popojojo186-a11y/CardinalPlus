@@ -1039,3 +1039,12 @@ svg.i.flip-v { transform: scaleY(-1); }
 .up-v { font-weight: 720; font-size: 17px; }
 .up-d { color: var(--muted); font-size: 13px; margin-top: 2px; }
 .up-notes { margin-top: 10px; white-space: pre-wrap; font-size: 14px; line-height: 1.5; max-height: 40vh; overflow: auto; }
+
+/* ---------- Cardinal перезапускается: плашка, пока приложение ждёт ---------- */
+.reconnect { position: fixed; left: 50%; bottom: calc(96px + env(safe-area-inset-bottom)); transform: translate(-50%, 20px); opacity: 0;
+    z-index: 9999; display: flex; align-items: center; gap: 10px; width: max-content; max-width: min(420px, calc(100% - 32px)); padding: 11px 16px; border-radius: 14px;
+    background: var(--text); color: var(--bg); font-size: 14px; font-weight: 600; box-shadow: 0 8px 30px rgba(0, 0, 0, .25);
+    transition: opacity .25s, transform .25s; pointer-events: none; }
+.reconnect.show { opacity: 1; transform: translate(-50%, 0); }
+.reconnect .spin { display: grid; place-items: center; }
+.reconnect .spin svg.i { width: 18px; height: 18px; animation: spin 1s linear infinite; }

@@ -378,6 +378,7 @@ class WebApp:
                 "account": self._account_info(),
                 "version": crd.VERSION,
                 "plus_version": plus_version.VERSION,
+                "keep_alive": bool(__import__("webapp")._state.get("front")),
                 "uptime": int(time.time()) - crd.start_time,
             }
 

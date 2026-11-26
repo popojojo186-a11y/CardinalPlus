@@ -31,6 +31,10 @@ logger = logging.getLogger("FPC.webapp")
 BIN_DIR = os.path.join("storage", "bin")
 RELEASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
 URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+# Cloudflare ограничил выдачу бесплатных туннелей этому IP (слишком много запусков подряд): ответ 429
+RATE_LIMIT_RE = re.compile(r"\b429\b|Too Many Requests|Tunnelstore request failed|error code: 1015|"
+                           r"invalid UUID length: 0|failed to unmarshal quick Tunnel", re.I)
+RATE_LIMIT_WAITS = (15 * 60, 30 * 60)   # первая пауза 15 минут, следующие — 30
 
 
 def _asset_name() -> tuple[str, str]:
@@ -98,6 +102,7 @@ class CloudflareTunnel:
         self.url: str | None = None
         self.process: subprocess.Popen | None = None
         self._stopped = False
+        self._limited = False   # cloudflared сообщил, что Cloudflare ограничил выдачу туннелей
         atexit.register(self.stop)
 
     def start(self):
@@ -111,9 +116,16 @@ class CloudflareTunnel:
             except OSError:
                 pass
 
+    def _sleep(self, seconds: float) -> None:
+        """Пауза, которую прерывает остановка туннеля."""
+        end = time.time() + seconds
+        while not self._stopped and time.time() < end:
+            time.sleep(min(1.0, end - time.time()))
+
     def _supervise(self):
         procguard.kill_orphans(f"http://127.0.0.1:{self.local_port}")  # туннели, брошенные прошлыми запусками
         delay = 5
+        limits = 0
         while not self._stopped:
             try:
                 binary = find_or_download()
@@ -130,10 +142,22 @@ class CloudflareTunnel:
                 logger.debug("TRACEBACK", exc_info=True)
             if self._stopped:
                 return
+            if self._limited:
+                # Частые повторы только продлевают ограничение — ждём, пока Cloudflare его снимет.
+                wait = RATE_LIMIT_WAITS[min(limits, len(RATE_LIMIT_WAITS) - 1)]
+                limits += 1
+                delay = 5
+                logger.warning("Mini App: Cloudflare временно не выдаёт туннели вашему интернет-адресу — слишком много "
+                               "запусков подряд (ответ 429). Это не ошибка Cardinal Plus и не вашего компьютера: "
+                               f"ограничение снимется само. Повторю через {wait // 60} мин. "
+                               "Не перезапускайте Cardinal и магазин часто: каждый запуск просит новый туннель.")
+                self._sleep(wait)
+                continue
+            limits = 0
             # Если туннель проработал долго — перезапускаем быстро, иначе увеличиваем паузу.
             delay = 5 if time.time() - started > 300 else min(delay * 2, 300)
             logger.warning(f"Mini App: туннель остановился, перезапуск через {delay} сек.")
-            time.sleep(delay)
+            self._sleep(delay)
 
     def _run_once(self, binary: str):
         cmd = [binary, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{self.local_port}"]
@@ -146,8 +170,11 @@ class CloudflareTunnel:
         procguard.bind_to_parent(self.process)  # закроется вместе с Cardinal, даже если окно закрыли крестиком
         logger.info("Mini App: запускаю туннель Cloudflare...")
         pending_url = None
+        self._limited = False
         for line in self.process.stderr:
             logger.debug(f"cloudflared: {line.rstrip()}")
+            if RATE_LIMIT_RE.search(line):
+                self._limited = True
             m = URL_RE.search(line)
             if m:
                 pending_url = m.group(0)

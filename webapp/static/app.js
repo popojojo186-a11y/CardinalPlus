@@ -190,13 +190,35 @@
         return `<div class="buyer" style="background:linear-gradient(135deg,${a},${b})">${esc((name || "?")[0].toUpperCase())}</div>`;
     }
 
+    // Cardinal перезапускается: входная дверь отвечает 425 — ждём и повторяем, показывая плашку
+    let reconnectEl = null;
+    function showReconnect(on) {
+        if (on && !reconnectEl) {
+            reconnectEl = document.createElement("div");
+            reconnectEl.className = "reconnect";
+            reconnectEl.innerHTML = `<span class="spin">${icon("refresh")}</span><span>Cardinal перезапускается — приложение подключится само…</span>`;
+            document.body.append(reconnectEl);
+            requestAnimationFrame(() => reconnectEl && reconnectEl.classList.add("show"));
+        } else if (!on && reconnectEl) {
+            const el = reconnectEl;
+            reconnectEl = null;
+            el.classList.remove("show");
+            setTimeout(() => el.remove(), 300);
+        }
+    }
     async function api(path, opts = {}) {
         const headers = { "Content-Type": "application/json", "X-CP": "1" };
         const init = initData();
         if (init) headers["X-Init-Data"] = init;
-        const res = await fetch(path, { method: opts.method || "GET", headers, body: opts.body ? JSON.stringify(opts.body) : undefined, credentials: "same-origin" });
-        let data = {};
-        try { data = await res.json(); } catch (e) {}
+        let res, data;
+        for (let attempt = 0; ; attempt++) {
+            res = await fetch(path, { method: opts.method || "GET", headers, body: opts.body ? JSON.stringify(opts.body) : undefined, credentials: "same-origin" });
+            data = {};
+            try { data = await res.json(); } catch (e) {}
+            if (res.status === 425 && data.restarting && attempt < 120) { showReconnect(true); await new Promise((r) => setTimeout(r, 2000)); continue; }
+            break;
+        }
+        showReconnect(false);
         if (!res.ok) {
             // без текста ошибки ответ пришёл не от Cardinal, а от туннеля Cloudflare: значит, Cardinal на компьютере не отвечает
             const err = new Error(data.error || ([502, 504, 530].includes(res.status) ? "Cardinal не отвечает — проверьте, что он запущен на компьютере, и обновите страницу" : `Ошибка ${res.status}`));
@@ -586,7 +608,7 @@
         state.paid = d.orders.paid;
         if (d.stock) { state.stock = d.stock; updateStockBadge(); }
         state.lastDash = new Date();
-        try { const me = await api("/api/me"); state.version = me.version; } catch (e) {}
+        try { const me = await api("/api/me"); state.version = me.version; state.keepAlive = !!me.keep_alive; } catch (e) {}
         updateChrome();
         return d;
     }
@@ -1124,6 +1146,18 @@
         });
     }
 
+    // Входная дверь работает: ждём, пока Cardinal поднимется, и обновляем приложение — заново открывать не нужно
+    async function waitRestart(box, title = "Cardinal перезапускается") {
+        box.innerHTML = `<div class="empty" style="padding:28px 12px 12px"><div class="e spin">${icon("refresh")}</div><div class="h">${esc(title)}</div>Подождите несколько секунд — приложение подключится само.</div>`;
+        await new Promise((r) => setTimeout(r, 2500));
+        for (let i = 0; i < 90; i++) {
+            try { await api("/api/me"); notify("success"); toast("Cardinal снова работает"); setTimeout(() => location.reload(), 600); return; }
+            catch (e) { await new Promise((r) => setTimeout(r, 2000)); }
+        }
+        box.innerHTML = `<div class="empty" style="padding:28px 12px 12px"><div class="e">${icon("alert")}</div><div class="h">Cardinal долго не отвечает</div>${inTelegram
+            ? "Проверьте окно Cardinal на компьютере и откройте приложение заново кнопкой в боте."
+            : "Проверьте окно Cardinal на компьютере и отправьте боту <code>/web</code>."}</div>`;
+    }
     function askRestart(box, r) {
         box.innerHTML = `
             <div class="head"><div class="ic tint-green">${icon("check")}</div><div style="flex:1;min-width:0"><div class="title">Обновление сохранено</div><div class="sub">${esc(r.name)} v${esc(r.version)}</div></div></div>
@@ -1139,6 +1173,7 @@
             haptic("medium");
             try { await api("/api/restart", { method: "POST", body: {} }); }
             catch (e) { toast(e.message, "err"); notify("error"); return; }
+            if (state.keepAlive) return waitRestart(box);
             box.innerHTML = `<div class="empty" style="padding:28px 12px 12px"><div class="e spin">${icon("refresh")}</div><div class="h">Cardinal перезапускается</div>${inTelegram
                 ? "Через полминуты откройте приложение заново кнопкой в боте."
                 : "Через полминуты отправьте боту <code>/web</code> и войдите по новой ссылке."}</div>
@@ -2809,6 +2844,7 @@
             body.innerHTML = updWait(st.stage_text || "Обновляю…");
         }
         notify("success");
+        if (state.keepAlive) { toast(`Cardinal Plus ${(st.result && st.result.to) || to} установлен`); return waitRestart(body, "Cardinal перезапускается с новой версией"); }
         body.innerHTML = `<div class="empty" style="padding:24px 12px 12px"><div class="e">${icon("check")}</div><div class="h">Cardinal Plus ${esc((st.result && st.result.to) || to)} установлен</div>${inTelegram
                 ? "Cardinal перезапускается. Через полминуты откройте приложение заново кнопкой в боте."
                 : "Cardinal перезапускается. Через полминуты отправьте боту <code>/web</code> и войдите по новой ссылке."}</div>
@@ -3327,8 +3363,7 @@
 
         if (!flat.length) {
             paint(head("", right) + stockEntryHtml() + (d.errors.length ? `<div class="error-box" style="margin-bottom:12px">${icon("alert")}<div>Часть данных не загрузилась: ${esc(d.errors.join(", "))}</div></div>` : "") +
-                emptyBox("tag", "Лотов не найдено", "Здесь появятся ваши лоты с FunPay.<br>Если все лоты выключены, добавьте их раздел вручную ниже.") +
-                `<button class="btn" id="demo-on" style="max-width:360px;margin:0 auto">${icon("sparkle")}Попробовать на демо-лотах</button>` + addSubBlock());
+                emptyBox("tag", "Лотов не найдено", "Здесь появятся ваши лоты с FunPay.<br>Если все лоты выключены, добавьте их раздел вручную ниже.") + addSubBlock());
             bindLotsCommon(alive);
             return;
         }
@@ -3341,7 +3376,7 @@
             </div>
             ${d.errors.length ? `<div class="note" style="margin:-4px 6px 12px">Не загрузилось: ${esc(d.errors.join(", "))}</div>` : ""}
             <div id="lots-list"></div>
-            ${d.demo ? "" : addSubBlock() + `<div class="note" style="text-align:center;margin-top:12px"><button class="link-btn" id="demo-on">Попробовать функции на демо-лотах</button></div>`}`);
+            ${d.demo ? "" : addSubBlock()}`);
 
         const listEl = $("lots-list");
         const draw = () => {
