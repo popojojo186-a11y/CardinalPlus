@@ -49,7 +49,7 @@
 
 ## 🛍 Плагины для Cardinal Plus
 
-Готовые плагины (например, Steam Guard Sender и Автоцены) — в моём магазине в Telegram: **[@sqeyeshopbot](https://t.me/sqeyeshopbot)**.
+Готовые плагины — в моём магазине в Telegram: **[@sqeyeshopbot](https://t.me/sqeyeshopbot)**.
 
 ## Ваши данные
 
